@@ -1,1 +1,51 @@
+[package]
+name = "windp"
+version = "0.1.0"
+edition = "2021"
+authors = ["Roi Seoane"]
+description = "Visor PDF de alto rendimiento con interfaz Glassmorphism"
 
+[dependencies]
+# --- Core Gráfico y Ventanas ---
+# winit: El estándar en Rust para crear ventanas sin bloat.
+winit = "0.29.10"
+
+# wgpu: Acceso directo a la GPU (Vulkan/DX12) usando la API WebGPU.
+# Es lo que permitirá el glassmorphism real con shaders personalizados.
+wgpu = "0.19.1"
+
+# pollster: Necesario porque wgpu es asíncrono; esto nos permite bloquear
+# el hilo main de forma minimalista (sin el peso de Tokio).
+pollster = "0.3.0"
+
+# --- Motor PDF ---
+# pdfium-render: Wrapper seguro sobre la librería C++ de Google.
+# Nota: Requiere la DLL de pdfium, que gestionaremos en build.rs.
+pdfium-render = "0.8.17"
+
+# --- Manipulación de Datos y Texturas ---
+# bytemuck: Esencial para enviar datos crudos (vértices, colores) a la GPU.
+bytemuck = { version = "1.14.3", features = ["derive"] }
+
+# image: Para cargar los iconos de la UI y manejar texturas.
+image = "0.24.9"
+
+# --- Debugging (Coste cero en release) ---
+log = "0.4.20"
+env_logger = "0.11.2"
+
+[build-dependencies]
+# Estas dependencias son SOLO para el script de compilación (build.rs).
+# Las usaremos para descargar automáticamente la librería PDFium correcta
+# y evitar que el usuario tenga que instalar nada manualmente.
+anyhow = "1.0"
+reqwest = { version = "0.11", features = ["blocking", "rustls-tls"] }
+zip = "0.6"
+
+# --- Perfil de Optimización Extrema ---
+[profile.release]
+opt-level = 3           # Máxima optimización de velocidad.
+lto = "fat"             # Link Time Optimization global: fusiona módulos para inlining agresivo.
+codegen-units = 1       # Compila en un solo hilo para maximizar la calidad del código generado.
+panic = "abort"         # Si falla, cierra instantáneamente. Ahorra espacio al quitar lógica de unwinding.
+strip = true            # Elimina símbolos de depuración para un .exe más ligero.
