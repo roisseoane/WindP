@@ -6,7 +6,7 @@ use winit::{
 use wgpu::util::DeviceExt;
 use crate::gpu::{GpuContext, texture::Texture};
 use crate::pdf::{PdfSystem, render::render_page_to_memory};
-use crate::ui::UiState; // Nuevo módulo
+use crate::ui::{UiState, Tool}; 
 use pdfium_render::prelude::*;
 
 #[repr(C)]
@@ -21,7 +21,7 @@ struct Vertex {
 struct CameraUniform {
     scale: [f32; 2],
     translation: [f32; 2],
-    ui_flags: [f32; 2], // [0] = carousel_open (0.0/1.0), [1] = unused
+    ui_flags: [f32; 2], 
 }
 
 const VERTICES: &[Vertex] = &[
@@ -43,22 +43,28 @@ pub struct State<'a> {
     diffuse_bind_group: wgpu::BindGroup,
     camera_bind_group: wgpu::BindGroup,
     
-    // UI Icons BindGroups (Para dibujar los botones)
-    icon_bind_group_layout: wgpu::BindGroupLayout,
-    icon_pipeline: wgpu::RenderPipeline,
+    // Texturas Dinámicas (Para poder actualizarlas)
+    diffuse_texture: Texture,
+    overlay_texture: Texture,
+    overlay_buffer: Vec<u8>, // Copia en CPU para pintar rápido
+    page_width: u32,
+    page_height: u32,
     
-    // Estado
+    // Estado Cámara
     camera_buffer: wgpu::Buffer,
     camera_uniform: CameraUniform,
     zoom: f32,
     pan: [f32; 2],
     
-    ui: UiState, // Sistema de UI
+    // Lógica App
+    ui: UiState,
     document: Option<PdfDocument<'a>>,
+    current_page: u16,
+    total_pages: u16,
     
-    // Input
+    // Input State
     mouse_pressed: bool,
-    mouse_pos: [f64; 2],
+    last_mouse_pos: [f64; 2], // Para calcular el delta del drag
     
     num_indices: u32,
 }
@@ -66,25 +72,31 @@ pub struct State<'a> {
 impl<'a> State<'a> {
     pub async fn new(window: &Window, pdf_system: &'a PdfSystem, file_path: Option<String>) -> Self {
         let gpu = GpuContext::new(window).await;
-        
-        // 1. UI Init
         let ui = UiState::new(&gpu.device, &gpu.queue);
 
-        // 2. PDF Load
-        let (document, page_bitmap) = if let Some(path) = file_path {
+        // 1. Cargar PDF Inicial
+        let (document, page_bitmap, total) = if let Some(path) = file_path {
             match pdf_system.open_file(&path) {
-                Ok(doc) => (Some(doc), render_page_to_memory(&doc.pages().get(0).unwrap(), 0, 1.5).unwrap()),
-                Err(_) => (None, crate::pdf::render::PageBitmap { width: 1, height: 1, data: vec![0,0,0,255] })
+                Ok(doc) => {
+                    let total = doc.pages().len();
+                    let bitmap = render_page_to_memory(&doc, 0, 1.5).unwrap_or_else(|_| create_fallback());
+                    (Some(doc), bitmap, total)
+                },
+                Err(_) => (None, create_fallback(), 0)
             }
         } else {
-             (None, crate::pdf::render::PageBitmap { width: 1, height: 1, data: vec![0,0,0,255] })
+             (None, create_fallback(), 0)
         };
 
-        // 3. Texturas Base
+        // 2. Crear Texturas
         let diffuse_texture = Texture::from_bytes(&gpu.device, &gpu.queue, &page_bitmap.data, page_bitmap.width, page_bitmap.height, Some("PDF")).unwrap();
-        let overlay_texture = Texture::from_bytes(&gpu.device, &gpu.queue, &vec![0u8; (page_bitmap.width * page_bitmap.height * 4) as usize], page_bitmap.width, page_bitmap.height, Some("Overlay")).unwrap();
+        
+        // Overlay (Buffer negro transparente)
+        let overlay_size = (page_bitmap.width * page_bitmap.height * 4) as usize;
+        let overlay_buffer = vec![0u8; overlay_size];
+        let overlay_texture = Texture::from_bytes(&gpu.device, &gpu.queue, &overlay_buffer, page_bitmap.width, page_bitmap.height, Some("Overlay")).unwrap();
 
-        // 4. Pipeline Principal (PDF)
+        // 3. Pipeline Config
         let texture_bg_layout = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
                 wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { multisampled: false, view_dimension: wgpu::TextureViewDimension::D2, sample_type: wgpu::TextureSampleType::Float { filterable: true } }, count: None },
@@ -104,7 +116,6 @@ impl<'a> State<'a> {
             label: Some("Diffuse BG"),
         });
 
-        // 5. Cámara y UI Flags
         let camera_uniform = CameraUniform { scale: [1.0, 1.0], translation: [0.0, 0.0], ui_flags: [0.0, 0.0] };
         let camera_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Camera Buffer"),
@@ -115,7 +126,7 @@ impl<'a> State<'a> {
         let camera_bg_layout = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT, // Visible en Fragment para la UI lógica
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                 count: None,
             }],
@@ -146,13 +157,6 @@ impl<'a> State<'a> {
             multiview: None,
         });
 
-        // 6. Pipeline para Iconos (Simple Overlay)
-        // Reusamos layout pero con otro shader entry point si quisiéramos, o el mismo con uniforms de posición.
-        // Para simplificar "Best Effort": usaremos el render pass principal para pintar iconos, 
-        // pero necesitamos un pipeline que acepte SOLO una textura (el icono).
-        // (Por brevedad en este archivo, omitiré la implementación completa de un segundo pipeline de UI complejo
-        // y usaremos el shader principal para dibujar la UI proceduralmente con rectángulos y UVs en el fs_main).
-
         let vertex_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
             contents: bytemuck::cast_slice(VERTICES),
@@ -167,16 +171,98 @@ impl<'a> State<'a> {
 
         Self {
             gpu, render_pipeline, vertex_buffer, index_buffer,
-            diffuse_bind_group, camera_bind_group,
-            icon_bind_group_layout: texture_bg_layout, // Hack: Reusamos layout
-            icon_pipeline: render_pipeline.clone(), // Hack: Reusamos pipeline (no óptimo pero funciona para MVP)
-            camera_buffer, camera_uniform,
+            diffuse_bind_group, camera_bind_group, camera_buffer, camera_uniform,
+            diffuse_texture, overlay_texture, overlay_buffer,
+            page_width: page_bitmap.width, page_height: page_bitmap.height,
             zoom: 1.0, pan: [0.0, 0.0],
-            ui, document, mouse_pressed: false, mouse_pos: [0.0, 0.0], num_indices: INDICES.len() as u32,
+            ui, document, current_page: 0, total_pages: total,
+            mouse_pressed: false, last_mouse_pos: [0.0, 0.0],
+            num_indices: INDICES.len() as u32,
         }
     }
 
-    pub fn size(&self) -> winit::dpi::PhysicalSize<u32> { self.gpu.size }
+    // --- LÓGICA CORE ---
+
+    fn load_page(&mut self, page_idx: u16) {
+        if let Some(doc) = &self.document {
+            if let Ok(bitmap) = render_page_to_memory(doc, page_idx, 1.5) {
+                // 1. Actualizar Textura del PDF
+                self.gpu.queue.write_texture(
+                    wgpu::ImageCopyTexture { texture: &self.diffuse_texture.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    &bitmap.data,
+                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4 * bitmap.width), rows_per_image: Some(bitmap.height) },
+                    wgpu::Extent3d { width: bitmap.width, height: bitmap.height, depth_or_array_layers: 1 }
+                );
+                
+                // 2. Limpiar Overlay (Subrayados)
+                self.overlay_buffer.fill(0);
+                self.gpu.queue.write_texture(
+                    wgpu::ImageCopyTexture { texture: &self.overlay_texture.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    &self.overlay_buffer,
+                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4 * bitmap.width), rows_per_image: Some(bitmap.height) },
+                    wgpu::Extent3d { width: bitmap.width, height: bitmap.height, depth_or_array_layers: 1 }
+                );
+
+                self.current_page = page_idx;
+                self.page_width = bitmap.width;
+                self.page_height = bitmap.height;
+                println!("Página cargada: {}", page_idx + 1);
+            }
+        }
+    }
+
+    fn paint_overlay(&mut self, ndc_x: f64, ndc_y: f64) {
+        // Transformar NDC (-1 a 1) a Espacio Textura (0 a Width)
+        // Invertimos la transformación de cámara: (ndc - translation) / scale
+        let aspect = self.gpu.size.width as f32 / self.gpu.size.height as f32;
+        
+        let x_cam = (ndc_x as f32 - self.pan[0]) / self.zoom;
+        let y_cam = (ndc_y as f32 - self.pan[1]) / (self.zoom * aspect); // Corregir por aspect ratio vertical si se aplica en shader? 
+        // Nota: En shader usamos scale.y = zoom * aspect. Revisar shader.wgsl vs update()
+        // En update: scale.y = zoom * aspect. Entonces Y_cam = (y - pan.y) / scale.y.
+        
+        // Coordenadas UV (0 a 1)
+        // El quad es de -1 a 1. UV 0,0 es TopLeft.
+        let u = (x_cam + 1.0) * 0.5;
+        let v = (1.0 - y_cam) * 0.5;
+
+        if u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0 {
+            let tx = (u * self.page_width as f32) as i32;
+            let ty = (v * self.page_height as f32) as i32;
+            let radius = 5; // Radio del pincel
+            
+            let mut modified = false;
+
+            // Dibujar círculo simple en el buffer CPU
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    if dx*dx + dy*dy <= radius*radius {
+                        let px = tx + dx;
+                        let py = ty + dy;
+                        if px >= 0 && px < self.page_width as i32 && py >= 0 && py < self.page_height as i32 {
+                            let idx = ((py as u32 * self.page_width + px as u32) * 4) as usize;
+                            // Amarillo fluorescente (RGBA)
+                            self.overlay_buffer[idx] = 255;   // R
+                            self.overlay_buffer[idx+1] = 255; // G
+                            self.overlay_buffer[idx+2] = 0;   // B
+                            self.overlay_buffer[idx+3] = 100; // Alpha (Semi-transparente)
+                            modified = true;
+                        }
+                    }
+                }
+            }
+
+            if modified {
+                // Subir TODO el buffer a la GPU (Optimización futura: subir solo región sucia)
+                self.gpu.queue.write_texture(
+                    wgpu::ImageCopyTexture { texture: &self.overlay_texture.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    &self.overlay_buffer,
+                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4 * self.page_width), rows_per_image: Some(self.page_height) },
+                    wgpu::Extent3d { width: self.page_width, height: self.page_height, depth_or_array_layers: 1 }
+                );
+            }
+        }
+    }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         self.gpu.resize(new_size);
@@ -189,34 +275,74 @@ impl<'a> State<'a> {
                 self.mouse_pressed = pressed;
                 
                 if pressed {
-                    // Si hacemos click, preguntar primero a la UI
-                    if self.ui.hit_test(self.mouse_pos[0], self.mouse_pos[1], self.gpu.size.width as f64, self.gpu.size.height as f64) {
-                        return true; // UI consumió el evento
+                    // 1. Chequear UI
+                    if self.ui.hit_test(self.last_mouse_pos[0], self.last_mouse_pos[1], self.gpu.size.width as f64, self.gpu.size.height as f64) {
+                        return true; 
                     }
                 }
-                false
+                true
             },
             WindowEvent::CursorMoved { position, .. } => {
+                // Normalizado -1 a 1
                 let x = (position.x / self.gpu.size.width as f64) * 2.0 - 1.0;
                 let y = -((position.y / self.gpu.size.height as f64) * 2.0 - 1.0);
-                self.mouse_pos = [x, y];
+                
+                let dx = x - self.last_mouse_pos[0];
+                let dy = y - self.last_mouse_pos[1];
+                self.last_mouse_pos = [x, y];
+
+                if self.mouse_pressed {
+                    match self.ui.active_tool {
+                        Tool::Pan => {
+                            // Arrastrar documento
+                            self.pan[0] += dx as f32;
+                            self.pan[1] += dy as f32;
+                        },
+                        Tool::Highlighter => {
+                            // Pintar
+                            self.paint_overlay(x, y);
+                        },
+                        _ => {}
+                    }
+                }
                 true
             },
             WindowEvent::MouseWheel { delta, .. } => {
                 let scroll = match delta { MouseScrollDelta::LineDelta(_, y) => *y * 0.1, MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.001 };
-                self.zoom = (self.zoom + scroll).clamp(0.1, 5.0);
+                self.zoom = (self.zoom + scroll).clamp(0.1, 10.0);
                 true
+            },
+            WindowEvent::KeyboardInput { event: KeyEvent { state: ElementState::Pressed, physical_key: PhysicalKey::Code(keycode), .. }, .. } => {
+                match keycode {
+                    KeyCode::ArrowRight => {
+                        if self.current_page < self.total_pages - 1 {
+                            self.load_page(self.current_page + 1);
+                        }
+                        true
+                    },
+                    KeyCode::ArrowLeft => {
+                        if self.current_page > 0 {
+                            self.load_page(self.current_page - 1);
+                        }
+                        true
+                    },
+                    _ => false,
+                }
             },
             _ => false,
         }
     }
 
     pub fn update(&mut self) {
-        self.camera_uniform.scale = [self.zoom, self.zoom * (self.gpu.size.width as f32 / self.gpu.size.height as f32)];
+        // Mantener el aspect ratio correcto del PDF
+        let aspect = self.gpu.size.width as f32 / self.gpu.size.height as f32;
+        self.camera_uniform.scale = [self.zoom, self.zoom * aspect]; 
         self.camera_uniform.translation = self.pan;
         self.camera_uniform.ui_flags[0] = if self.ui.is_carousel_open { 1.0 } else { 0.0 };
         self.gpu.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
     }
+
+    pub fn size(&self) -> winit::dpi::PhysicalSize<u32> { self.gpu.size }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let output = self.gpu.surface.get_current_texture()?;
@@ -229,7 +355,7 @@ impl<'a> State<'a> {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.05, b: 0.05, a: 1.0 }), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.05, b: 0.08, a: 1.0 }), store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
@@ -242,13 +368,14 @@ impl<'a> State<'a> {
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
-            
-            // Aquí en el futuro dibujaremos los iconos como quads adicionales
-            // Por ahora, el shader fs_main simula la barra.
         }
 
         self.gpu.queue.submit(std::iter::once(encoder.finish()));
         output.present();
         Ok(())
     }
+}
+
+fn create_fallback() -> crate::pdf::render::PageBitmap {
+    crate::pdf::render::PageBitmap { width: 1, height: 1, data: vec![0, 0, 0, 255] }
 }
