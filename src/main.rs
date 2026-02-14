@@ -1,4 +1,5 @@
-use windp::state::State; // Asumimos que state.rs expondrá la lógica principal
+use windp::state::State;
+use windp::pdf::PdfSystem; // Necesitamos instanciarlo aquí para manejar lifetimes
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
@@ -6,30 +7,35 @@ use winit::{
 };
 
 fn main() {
-    // 1. Inicializar logger para debug (coste cero en release)
     env_logger::init();
 
-    // 2. Crear el bucle de eventos del sistema operativo
-    let event_loop = EventLoop::new().unwrap();
+    // 1. Capturar argumentos de lanzamiento (Para "Abrir con...")
+    let args: Vec<String> = std::env::args().collect();
+    let file_path = if args.len() > 1 {
+        // args[0] es el ejecutable, args[1] es el archivo PDF
+        Some(args[1].clone())
+    } else {
+        None
+    };
 
-    // 3. Configurar la ventana nativa
+    let event_loop = EventLoop::new().unwrap();
     let window = WindowBuilder::new()
-        .with_title("WindP - Visualizador de Alto Rendimiento")
+        .with_title("WindP")
         .with_inner_size(winit::dpi::PhysicalSize::new(1200, 800))
-        .with_transparent(true) // Crucial para glassmorphism (depende del compositor del OS)
-        .with_decorations(true) // Mantenemos bordes por ahora, luego podemos personalizarlos
+        .with_transparent(true)
+        .with_decorations(true)
         .build(&event_loop)
         .unwrap();
 
-    // 4. Inicializar el Estado de la App (GPU + Lógica)
-    // Usamos pollster para bloquear el hilo main solo durante la carga inicial
-    // ya que wgpu es asíncrono por naturaleza.
-    let mut state = pollster::block_on(State::new(&window));
+    // 2. Inicializar sistema PDF en el hilo principal
+    // Lo creamos aquí para que viva tanto como la ventana
+    let pdf_system = PdfSystem::new();
 
-    // 5. Arrancar el bucle infinito
+    // 3. Pasamos el sistema y la ruta (si existe) al Estado
+    let mut state = pollster::block_on(State::new(&window, &pdf_system, file_path));
+
     let _ = event_loop.run(move |event, elwt| {
         match event {
-            // Evento: La ventana pide redibujarse
             Event::WindowEvent {
                 ref event,
                 window_id,
@@ -55,9 +61,7 @@ fn main() {
                             state.update();
                             match state.render() {
                                 Ok(_) => {}
-                                // Si perdemos la superficie (ej: minimizar), la reconfiguramos
-                                Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
-                                // Si falta memoria, salimos (mejor crashear que corromper)
+                                Err(wgpu::SurfaceError::Lost) => state.resize(state.size()),
                                 Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
                                 Err(e) => eprintln!("{:?}", e),
                             }
@@ -66,7 +70,6 @@ fn main() {
                     }
                 }
             }
-            // Evento: La CPU está ociosa, pedimos redibujar para mantener FPS estables
             Event::AboutToWait => {
                 window.request_redraw();
             }
