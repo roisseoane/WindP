@@ -1,1 +1,44 @@
+name: Build and Release Installer
 
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Cache Cargo registry
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install WiX Toolset
+      run: cargo install cargo-wix
+
+    - name: Build and Package (MSI)
+      # Ejecutamos cargo wix. 
+      # --no-sign porque no tenemos certificado digital de pago (Windows avisará al instalar, es normal).
+      # --nocapture para ver logs si falla.
+      run: cargo wix --no-sign --nocapture
+
+    - name: Upload MSI Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: WindP-Installer
+        path: target/wix/*.msi
+        if-no-files-found: error
